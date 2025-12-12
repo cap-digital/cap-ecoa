@@ -21,6 +21,14 @@ async def lifespan(app: FastAPI):
     logger.info(f"Starting {settings.APP_NAME}")
     logger.info(f"Debug mode: {settings.DEBUG}")
 
+    # Initialize database tables
+    try:
+        from .database import init_db
+        init_db()
+        logger.info("Database tables initialized successfully")
+    except Exception as e:
+        logger.error(f"Failed to initialize database: {e}")
+
     # Download NLTK data for TextBlob (first run only)
     try:
         import nltk

@@ -1,14 +1,18 @@
 from fastapi import APIRouter, HTTPException, Depends
 from typing import List
-from ..database import get_supabase
+from sqlalchemy.orm import Session
+from sqlalchemy import func
+
+from ..database import get_db
 from ..config import settings
+from ..models import User, MonitoredTerm, NewsTermMatch
+from ..services.auth import get_current_user
 from ..schemas.filter import (
     FilterCreate,
     FilterUpdate,
     FilterResponse,
     FilterListResponse
 )
-from .auth import get_current_user
 
 router = APIRouter(prefix="/filters", tags=["Filters"])
 
@@ -20,35 +24,34 @@ def get_user_plan_limit(plan_type: str) -> int:
 
 
 @router.get("", response_model=FilterListResponse)
-async def list_filters(current_user=Depends(get_current_user)):
-    supabase = get_supabase()
-
-    # Get user profile for plan type
-    profile = supabase.table("ecoa_profiles").select("plan_type").eq(
-        "id", current_user.id
-    ).single().execute()
-
-    plan_type = profile.data.get("plan_type", "free") if profile.data else "free"
+async def list_filters(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    plan_type = current_user.plan_type.value
     plan_limit = get_user_plan_limit(plan_type)
 
     # Get filters with match counts
-    filters_result = supabase.table("ecoa_monitored_terms").select(
-        "*, ecoa_news_term_matches(count)"
-    ).eq("user_id", current_user.id).order("created_at", desc=True).execute()
+    filters_query = db.query(
+        MonitoredTerm,
+        func.count(NewsTermMatch.id).label('match_count')
+    ).outerjoin(
+        NewsTermMatch, MonitoredTerm.id == NewsTermMatch.term_id
+    ).filter(
+        MonitoredTerm.user_id == current_user.id
+    ).group_by(MonitoredTerm.id).order_by(MonitoredTerm.created_at.desc())
+
+    filters_result = filters_query.all()
 
     filters = []
-    for f in filters_result.data or []:
-        match_count = 0
-        if f.get("ecoa_news_term_matches"):
-            match_count = len(f["ecoa_news_term_matches"])
-
+    for term, match_count in filters_result:
         filters.append(FilterResponse(
-            id=f["id"],
-            user_id=f["user_id"],
-            term=f["term"],
-            is_active=f["is_active"],
-            created_at=f["created_at"],
-            match_count=match_count
+            id=term.id,
+            user_id=term.user_id,
+            term=term.term,
+            is_active=term.is_active,
+            created_at=term.created_at,
+            match_count=match_count or 0
         ))
 
     return FilterListResponse(
@@ -60,53 +63,51 @@ async def list_filters(current_user=Depends(get_current_user)):
 
 
 @router.post("", response_model=FilterResponse)
-async def create_filter(filter_data: FilterCreate, current_user=Depends(get_current_user)):
-    supabase = get_supabase()
-
-    # Check plan limit
-    profile = supabase.table("ecoa_profiles").select("plan_type").eq(
-        "id", current_user.id
-    ).single().execute()
-
-    plan_type = profile.data.get("plan_type", "free") if profile.data else "free"
+async def create_filter(
+    filter_data: FilterCreate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    plan_type = current_user.plan_type.value
     plan_limit = get_user_plan_limit(plan_type)
 
     # Count existing filters
-    existing = supabase.table("ecoa_monitored_terms").select(
-        "id", count="exact"
-    ).eq("user_id", current_user.id).execute()
+    existing_count = db.query(MonitoredTerm).filter(
+        MonitoredTerm.user_id == current_user.id
+    ).count()
 
-    if existing.count >= plan_limit:
+    if existing_count >= plan_limit:
         raise HTTPException(
             status_code=403,
             detail=f"Limite de {plan_limit} termos atingido. Faça upgrade para o plano Pro."
         )
 
     # Check if term already exists for this user
-    existing_term = supabase.table("ecoa_monitored_terms").select("id").eq(
-        "user_id", current_user.id
-    ).eq("term", filter_data.term.lower()).execute()
+    existing_term = db.query(MonitoredTerm).filter(
+        MonitoredTerm.user_id == current_user.id,
+        MonitoredTerm.term == filter_data.term.lower()
+    ).first()
 
-    if existing_term.data:
+    if existing_term:
         raise HTTPException(status_code=400, detail="Termo já cadastrado")
 
     # Create filter
-    new_filter = supabase.table("ecoa_monitored_terms").insert({
-        "user_id": current_user.id,
-        "term": filter_data.term.lower(),
-        "is_active": filter_data.is_active
-    }).execute()
+    new_filter = MonitoredTerm(
+        user_id=current_user.id,
+        term=filter_data.term.lower(),
+        is_active=filter_data.is_active
+    )
 
-    if not new_filter.data:
-        raise HTTPException(status_code=500, detail="Erro ao criar filtro")
+    db.add(new_filter)
+    db.commit()
+    db.refresh(new_filter)
 
-    f = new_filter.data[0]
     return FilterResponse(
-        id=f["id"],
-        user_id=f["user_id"],
-        term=f["term"],
-        is_active=f["is_active"],
-        created_at=f["created_at"],
+        id=new_filter.id,
+        user_id=new_filter.user_id,
+        term=new_filter.term,
+        is_active=new_filter.is_active,
+        created_at=new_filter.created_at,
         match_count=0
     )
 
@@ -115,16 +116,16 @@ async def create_filter(filter_data: FilterCreate, current_user=Depends(get_curr
 async def update_filter(
     filter_id: str,
     filter_data: FilterUpdate,
-    current_user=Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
 ):
-    supabase = get_supabase()
-
     # Check ownership
-    existing = supabase.table("ecoa_monitored_terms").select("*").eq(
-        "id", filter_id
-    ).eq("user_id", current_user.id).single().execute()
+    existing = db.query(MonitoredTerm).filter(
+        MonitoredTerm.id == filter_id,
+        MonitoredTerm.user_id == current_user.id
+    ).first()
 
-    if not existing.data:
+    if not existing:
         raise HTTPException(status_code=404, detail="Filtro não encontrado")
 
     # Update
@@ -132,37 +133,39 @@ async def update_filter(
     if "term" in update_data:
         update_data["term"] = update_data["term"].lower()
 
-    updated = supabase.table("ecoa_monitored_terms").update(update_data).eq(
-        "id", filter_id
-    ).execute()
+    for key, value in update_data.items():
+        setattr(existing, key, value)
 
-    f = updated.data[0]
+    db.commit()
+    db.refresh(existing)
+
     return FilterResponse(
-        id=f["id"],
-        user_id=f["user_id"],
-        term=f["term"],
-        is_active=f["is_active"],
-        created_at=f["created_at"],
+        id=existing.id,
+        user_id=existing.user_id,
+        term=existing.term,
+        is_active=existing.is_active,
+        created_at=existing.created_at,
         match_count=0
     )
 
 
 @router.delete("/{filter_id}")
-async def delete_filter(filter_id: str, current_user=Depends(get_current_user)):
-    supabase = get_supabase()
-
+async def delete_filter(
+    filter_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
     # Check ownership
-    existing = supabase.table("ecoa_monitored_terms").select("id").eq(
-        "id", filter_id
-    ).eq("user_id", current_user.id).single().execute()
+    existing = db.query(MonitoredTerm).filter(
+        MonitoredTerm.id == filter_id,
+        MonitoredTerm.user_id == current_user.id
+    ).first()
 
-    if not existing.data:
+    if not existing:
         raise HTTPException(status_code=404, detail="Filtro não encontrado")
 
-    # Delete related matches first
-    supabase.table("ecoa_news_term_matches").delete().eq("term_id", filter_id).execute()
-
-    # Delete filter
-    supabase.table("ecoa_monitored_terms").delete().eq("id", filter_id).execute()
+    # Delete (cascade will handle related matches)
+    db.delete(existing)
+    db.commit()
 
     return {"message": "Filtro removido com sucesso"}

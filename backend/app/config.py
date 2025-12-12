@@ -1,5 +1,6 @@
 from pydantic_settings import BaseSettings
 from functools import lru_cache
+from typing import Optional
 
 
 class Settings(BaseSettings):
@@ -8,9 +9,31 @@ class Settings(BaseSettings):
     DEBUG: bool = True
     API_V1_PREFIX: str = "/api/v1"
 
-    # Supabase
-    SUPABASE_URL: str = "https://cqrpbiepyeypbkizwacu.supabase.co"
-    SUPABASE_ANON_KEY: str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNxcnBiaWVweWV5cGJraXp3YWN1Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTU3MDA0MTksImV4cCI6MjA3MTI3NjQxOX0.Iyy2W5tw0-40sQdRfFJTfwYij4iUl8-KoUlg39u7kOE"
+    # MySQL Database (Railway)
+    MYSQL_HOST: str = "localhost"
+    MYSQL_PORT: int = 3306
+    MYSQL_USER: str = "root"
+    MYSQL_PASSWORD: str = ""
+    MYSQL_DATABASE: str = "ecoa"
+    DATABASE_URL: Optional[str] = None
+
+    @property
+    def mysql_url(self) -> str:
+        if self.DATABASE_URL:
+            # Railway provides DATABASE_URL
+            return self.DATABASE_URL.replace("mysql://", "mysql+pymysql://")
+        return f"mysql+pymysql://{self.MYSQL_USER}:{self.MYSQL_PASSWORD}@{self.MYSQL_HOST}:{self.MYSQL_PORT}/{self.MYSQL_DATABASE}"
+
+    @property
+    def async_mysql_url(self) -> str:
+        if self.DATABASE_URL:
+            return self.DATABASE_URL.replace("mysql://", "mysql+aiomysql://")
+        return f"mysql+aiomysql://{self.MYSQL_USER}:{self.MYSQL_PASSWORD}@{self.MYSQL_HOST}:{self.MYSQL_PORT}/{self.MYSQL_DATABASE}"
+
+    # JWT Authentication
+    JWT_SECRET_KEY: str = "your-super-secret-key-change-in-production"
+    JWT_ALGORITHM: str = "HS256"
+    JWT_ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 7  # 7 days
 
     # Redis (for Celery)
     REDIS_URL: str = "redis://localhost:6379/0"
@@ -27,6 +50,7 @@ class Settings(BaseSettings):
         "http://localhost:5173",
         "http://localhost:3000",
         "http://127.0.0.1:5173",
+        "https://*.railway.app",
     ]
 
     class Config:

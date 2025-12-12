@@ -1,6 +1,15 @@
-from fastapi import APIRouter, HTTPException, Depends, Header
-from typing import Optional
-from ..database import get_supabase
+from fastapi import APIRouter, HTTPException, Depends
+from sqlalchemy.orm import Session
+from datetime import timedelta
+
+from ..database import get_db
+from ..models import User, PlanType
+from ..services.auth import (
+    get_password_hash,
+    create_access_token,
+    authenticate_user,
+    get_current_user
+)
 from ..schemas.user import (
     UserCreate,
     UserLogin,
@@ -8,160 +17,128 @@ from ..schemas.user import (
     UserResponse,
     TokenResponse
 )
+from ..config import settings
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
 
-def get_current_user(authorization: Optional[str] = Header(None)):
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Token não fornecido")
-
-    token = authorization.replace("Bearer ", "")
-    supabase = get_supabase()
-
-    try:
-        user = supabase.auth.get_user(token)
-        if not user:
-            raise HTTPException(status_code=401, detail="Token inválido")
-        return user.user
-    except Exception as e:
-        raise HTTPException(status_code=401, detail="Token inválido ou expirado")
-
-
 @router.post("/register", response_model=TokenResponse)
-async def register(user_data: UserCreate):
-    supabase = get_supabase()
+async def register(user_data: UserCreate, db: Session = Depends(get_db)):
+    # Check if email already exists
+    existing_user = db.query(User).filter(User.email == user_data.email).first()
+    if existing_user:
+        raise HTTPException(status_code=400, detail="Email já cadastrado")
 
-    try:
-        # Create user in Supabase Auth
-        auth_response = supabase.auth.sign_up({
-            "email": user_data.email,
-            "password": user_data.password,
-            "options": {
-                "data": {
-                    "full_name": user_data.full_name,
-                    "political_name": user_data.political_name,
-                    "party": user_data.party,
-                    "state": user_data.state,
-                }
-            }
-        })
+    # Create new user
+    hashed_password = get_password_hash(user_data.password)
+    new_user = User(
+        email=user_data.email,
+        hashed_password=hashed_password,
+        full_name=user_data.full_name,
+        political_name=user_data.political_name,
+        party=user_data.party,
+        state=user_data.state,
+        plan_type=PlanType.FREE,
+        is_active=True,
+        is_verified=False
+    )
 
-        if not auth_response.user:
-            raise HTTPException(status_code=400, detail="Erro ao criar usuário")
+    db.add(new_user)
+    db.commit()
+    db.refresh(new_user)
 
-        # Create profile in profiles table
-        profile_data = {
-            "id": auth_response.user.id,
-            "full_name": user_data.full_name,
-            "political_name": user_data.political_name,
-            "party": user_data.party,
-            "state": user_data.state,
-            "plan_type": "free"
-        }
+    # Generate JWT token
+    access_token = create_access_token(
+        data={"sub": new_user.id},
+        expires_delta=timedelta(minutes=settings.JWT_ACCESS_TOKEN_EXPIRE_MINUTES)
+    )
 
-        supabase.table("ecoa_profiles").insert(profile_data).execute()
-
-        return TokenResponse(
-            access_token=auth_response.session.access_token,
-            user=UserResponse(
-                id=auth_response.user.id,
-                email=auth_response.user.email,
-                full_name=user_data.full_name,
-                political_name=user_data.political_name,
-                party=user_data.party,
-                state=user_data.state,
-                plan_type="free"
-            )
+    return TokenResponse(
+        access_token=access_token,
+        user=UserResponse(
+            id=new_user.id,
+            email=new_user.email,
+            full_name=new_user.full_name,
+            political_name=new_user.political_name,
+            party=new_user.party,
+            state=new_user.state,
+            plan_type=new_user.plan_type.value,
+            created_at=new_user.created_at
         )
-    except Exception as e:
-        if "already registered" in str(e).lower():
-            raise HTTPException(status_code=400, detail="Email já cadastrado")
-        raise HTTPException(status_code=400, detail=str(e))
+    )
 
 
 @router.post("/login", response_model=TokenResponse)
-async def login(credentials: UserLogin):
-    supabase = get_supabase()
+async def login(credentials: UserLogin, db: Session = Depends(get_db)):
+    user = authenticate_user(db, credentials.email, credentials.password)
 
-    try:
-        auth_response = supabase.auth.sign_in_with_password({
-            "email": credentials.email,
-            "password": credentials.password
-        })
-
-        if not auth_response.user:
-            raise HTTPException(status_code=401, detail="Credenciais inválidas")
-
-        # Get profile data
-        profile = supabase.table("ecoa_profiles").select("*").eq(
-            "id", auth_response.user.id
-        ).single().execute()
-
-        profile_data = profile.data if profile.data else {}
-
-        return TokenResponse(
-            access_token=auth_response.session.access_token,
-            user=UserResponse(
-                id=auth_response.user.id,
-                email=auth_response.user.email,
-                full_name=profile_data.get("full_name"),
-                political_name=profile_data.get("political_name"),
-                party=profile_data.get("party"),
-                state=profile_data.get("state"),
-                avatar_url=profile_data.get("avatar_url"),
-                plan_type=profile_data.get("plan_type", "free"),
-                created_at=profile_data.get("created_at")
-            )
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
+    if not user:
         raise HTTPException(status_code=401, detail="Credenciais inválidas")
+
+    access_token = create_access_token(
+        data={"sub": user.id},
+        expires_delta=timedelta(minutes=settings.JWT_ACCESS_TOKEN_EXPIRE_MINUTES)
+    )
+
+    return TokenResponse(
+        access_token=access_token,
+        user=UserResponse(
+            id=user.id,
+            email=user.email,
+            full_name=user.full_name,
+            political_name=user.political_name,
+            party=user.party,
+            state=user.state,
+            avatar_url=user.avatar_url,
+            plan_type=user.plan_type.value,
+            created_at=user.created_at
+        )
+    )
 
 
 @router.post("/logout")
-async def logout(current_user=Depends(get_current_user)):
-    supabase = get_supabase()
-    try:
-        supabase.auth.sign_out()
-        return {"message": "Logout realizado com sucesso"}
-    except Exception:
-        return {"message": "Logout realizado"}
+async def logout(current_user: User = Depends(get_current_user)):
+    # JWT é stateless, então logout é feito no cliente removendo o token
+    return {"message": "Logout realizado com sucesso"}
 
 
 @router.get("/me", response_model=UserResponse)
-async def get_me(current_user=Depends(get_current_user)):
-    supabase = get_supabase()
-
-    profile = supabase.table("ecoa_profiles").select("*").eq(
-        "id", current_user.id
-    ).single().execute()
-
-    profile_data = profile.data if profile.data else {}
-
+async def get_me(current_user: User = Depends(get_current_user)):
     return UserResponse(
         id=current_user.id,
         email=current_user.email,
-        full_name=profile_data.get("full_name"),
-        political_name=profile_data.get("political_name"),
-        party=profile_data.get("party"),
-        state=profile_data.get("state"),
-        avatar_url=profile_data.get("avatar_url"),
-        plan_type=profile_data.get("plan_type", "free"),
-        created_at=profile_data.get("created_at")
+        full_name=current_user.full_name,
+        political_name=current_user.political_name,
+        party=current_user.party,
+        state=current_user.state,
+        avatar_url=current_user.avatar_url,
+        plan_type=current_user.plan_type.value,
+        created_at=current_user.created_at
     )
 
 
 @router.put("/me", response_model=UserResponse)
-async def update_me(user_data: UserUpdate, current_user=Depends(get_current_user)):
-    supabase = get_supabase()
-
+async def update_me(
+    user_data: UserUpdate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
     update_data = user_data.model_dump(exclude_unset=True)
 
-    if update_data:
-        supabase.table("ecoa_profiles").update(update_data).eq(
-            "id", current_user.id
-        ).execute()
+    for key, value in update_data.items():
+        setattr(current_user, key, value)
 
-    return await get_me(current_user)
+    db.commit()
+    db.refresh(current_user)
+
+    return UserResponse(
+        id=current_user.id,
+        email=current_user.email,
+        full_name=current_user.full_name,
+        political_name=current_user.political_name,
+        party=current_user.party,
+        state=current_user.state,
+        avatar_url=current_user.avatar_url,
+        plan_type=current_user.plan_type.value,
+        created_at=current_user.created_at
+    )

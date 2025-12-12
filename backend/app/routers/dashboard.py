@@ -1,7 +1,12 @@
 from fastapi import APIRouter, Depends
 from datetime import datetime, timedelta
 from collections import defaultdict
-from ..database import get_supabase
+from sqlalchemy.orm import Session
+from sqlalchemy import or_
+
+from ..database import get_db
+from ..models import User, News, MonitoredTerm, SentimentType
+from ..services.auth import get_current_user
 from ..schemas.dashboard import (
     StatsResponse,
     TrendResponse,
@@ -9,21 +14,33 @@ from ..schemas.dashboard import (
     SourceStats,
     DashboardResponse
 )
-from .auth import get_current_user
 
 router = APIRouter(prefix="/dashboard", tags=["Dashboard"])
 
 
+def get_user_terms(db: Session, user_id: str, active_only: bool = True):
+    """Get user's monitored terms"""
+    query = db.query(MonitoredTerm).filter(MonitoredTerm.user_id == user_id)
+    if active_only:
+        query = query.filter(MonitoredTerm.is_active == True)
+    return [t.term for t in query.all()]
+
+
+def build_term_filter(terms: list):
+    """Build SQLAlchemy filter for terms"""
+    term_filters = []
+    for t in terms:
+        term_filters.append(News.title.ilike(f"%{t}%"))
+        term_filters.append(News.content.ilike(f"%{t}%"))
+    return or_(*term_filters) if term_filters else None
+
+
 @router.get("/stats", response_model=StatsResponse)
-async def get_stats(current_user=Depends(get_current_user)):
-    supabase = get_supabase()
-
-    # Get user's active terms
-    terms_result = supabase.table("ecoa_monitored_terms").select("term").eq(
-        "user_id", current_user.id
-    ).eq("is_active", True).execute()
-
-    terms = [t["term"] for t in terms_result.data] if terms_result.data else []
+async def get_stats(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    terms = get_user_terms(db, current_user.id)
     active_terms = len(terms)
 
     if not terms:
@@ -36,59 +53,51 @@ async def get_stats(current_user=Depends(get_current_user)):
             active_terms=0
         )
 
-    # Build filter for user's terms
-    term_filters = ",".join([
-        f"title.ilike.%{t}%,content.ilike.%{t}%" for t in terms
-    ])
+    term_filter = build_term_filter(terms)
 
     # Total news matching user's terms
-    total_result = supabase.table("ecoa_news").select(
-        "id", count="exact"
-    ).or_(term_filters).execute()
-
-    total_news = total_result.count or 0
+    total_news = db.query(News).filter(term_filter).count()
 
     # News today
     today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-    today_result = supabase.table("ecoa_news").select(
-        "id", count="exact"
-    ).or_(term_filters).gte("published_at", today.isoformat()).execute()
-
-    news_today = today_result.count or 0
+    news_today = db.query(News).filter(
+        term_filter,
+        News.published_at >= today
+    ).count()
 
     # Sentiment counts
-    positive_result = supabase.table("ecoa_news").select(
-        "id", count="exact"
-    ).or_(term_filters).eq("sentiment", "positive").execute()
+    positive_mentions = db.query(News).filter(
+        term_filter,
+        News.sentiment == SentimentType.POSITIVE
+    ).count()
 
-    negative_result = supabase.table("ecoa_news").select(
-        "id", count="exact"
-    ).or_(term_filters).eq("sentiment", "negative").execute()
+    negative_mentions = db.query(News).filter(
+        term_filter,
+        News.sentiment == SentimentType.NEGATIVE
+    ).count()
 
-    neutral_result = supabase.table("ecoa_news").select(
-        "id", count="exact"
-    ).or_(term_filters).eq("sentiment", "neutral").execute()
+    neutral_mentions = db.query(News).filter(
+        term_filter,
+        News.sentiment == SentimentType.NEUTRAL
+    ).count()
 
     return StatsResponse(
         total_news=total_news,
         news_today=news_today,
-        positive_mentions=positive_result.count or 0,
-        negative_mentions=negative_result.count or 0,
-        neutral_mentions=neutral_result.count or 0,
+        positive_mentions=positive_mentions,
+        negative_mentions=negative_mentions,
+        neutral_mentions=neutral_mentions,
         active_terms=active_terms
     )
 
 
 @router.get("/trends", response_model=list[TrendResponse])
-async def get_trends(days: int = 7, current_user=Depends(get_current_user)):
-    supabase = get_supabase()
-
-    # Get user's active terms
-    terms_result = supabase.table("ecoa_monitored_terms").select("term").eq(
-        "user_id", current_user.id
-    ).eq("is_active", True).execute()
-
-    terms = [t["term"] for t in terms_result.data] if terms_result.data else []
+async def get_trends(
+    days: int = 7,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    terms = get_user_terms(db, current_user.id)
 
     if not terms:
         return []
@@ -98,20 +107,24 @@ async def get_trends(days: int = 7, current_user=Depends(get_current_user)):
 
     for term in terms[:5]:  # Limit to top 5 terms
         # Get news for this term in the date range
-        result = supabase.table("ecoa_news").select(
-            "published_at, sentiment_score"
-        ).or_(
-            f"title.ilike.%{term}%,content.ilike.%{term}%"
-        ).gte("published_at", start_date.isoformat()).execute()
+        term_filter = or_(
+            News.title.ilike(f"%{term}%"),
+            News.content.ilike(f"%{term}%")
+        )
+
+        news_list = db.query(News).filter(
+            term_filter,
+            News.published_at >= start_date
+        ).all()
 
         # Group by date
         daily_data = defaultdict(lambda: {"count": 0, "sentiment_sum": 0})
 
-        for news in result.data or []:
-            if news.get("published_at"):
-                date_str = news["published_at"][:10]  # YYYY-MM-DD
+        for news in news_list:
+            if news.published_at:
+                date_str = news.published_at.strftime("%Y-%m-%d")
                 daily_data[date_str]["count"] += 1
-                daily_data[date_str]["sentiment_sum"] += news.get("sentiment_score") or 0
+                daily_data[date_str]["sentiment_sum"] += news.sentiment_score or 0
 
         # Build trend points
         data_points = []
@@ -129,32 +142,26 @@ async def get_trends(days: int = 7, current_user=Depends(get_current_user)):
 
 
 @router.get("/sources", response_model=list[SourceStats])
-async def get_source_stats(current_user=Depends(get_current_user)):
-    supabase = get_supabase()
-
-    # Get user's active terms
-    terms_result = supabase.table("ecoa_monitored_terms").select("term").eq(
-        "user_id", current_user.id
-    ).eq("is_active", True).execute()
-
-    terms = [t["term"] for t in terms_result.data] if terms_result.data else []
+async def get_source_stats(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    terms = get_user_terms(db, current_user.id)
 
     if not terms:
         return []
 
-    term_filters = ",".join([
-        f"title.ilike.%{t}%,content.ilike.%{t}%" for t in terms
-    ])
+    term_filter = build_term_filter(terms)
 
-    # Get all news sources distribution
-    result = supabase.table("ecoa_news").select("source").or_(term_filters).execute()
+    # Get all news matching terms
+    news_list = db.query(News.source).filter(term_filter).all()
 
     # Count by source
     source_counts = defaultdict(int)
     total = 0
 
-    for news in result.data or []:
-        source_counts[news["source"]] += 1
+    for (source,) in news_list:
+        source_counts[source] += 1
         total += 1
 
     # Calculate percentages
@@ -170,32 +177,37 @@ async def get_source_stats(current_user=Depends(get_current_user)):
 
 
 @router.get("", response_model=DashboardResponse)
-async def get_dashboard(current_user=Depends(get_current_user)):
-    supabase = get_supabase()
-
+async def get_dashboard(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
     # Get all dashboard data
-    stats = await get_stats(current_user)
-    trends = await get_trends(7, current_user)
-    sources = await get_source_stats(current_user)
+    stats = await get_stats(current_user, db)
+    trends = await get_trends(7, current_user, db)
+    sources = await get_source_stats(current_user, db)
 
     # Get recent news
-    terms_result = supabase.table("ecoa_monitored_terms").select("term").eq(
-        "user_id", current_user.id
-    ).eq("is_active", True).execute()
-
-    terms = [t["term"] for t in terms_result.data] if terms_result.data else []
+    terms = get_user_terms(db, current_user.id)
     recent_news = []
 
     if terms:
-        term_filters = ",".join([
-            f"title.ilike.%{t}%,content.ilike.%{t}%" for t in terms
-        ])
+        term_filter = build_term_filter(terms)
 
-        recent_result = supabase.table("ecoa_news").select(
-            "id, title, source, sentiment, published_at, image_url"
-        ).or_(term_filters).order("published_at", desc=True).limit(5).execute()
+        recent_list = db.query(News).filter(term_filter).order_by(
+            News.published_at.desc()
+        ).limit(5).all()
 
-        recent_news = recent_result.data or []
+        recent_news = [
+            {
+                "id": n.id,
+                "title": n.title,
+                "source": n.source,
+                "sentiment": n.sentiment.value if n.sentiment else None,
+                "published_at": n.published_at.isoformat() if n.published_at else None,
+                "image_url": n.image_url
+            }
+            for n in recent_list
+        ]
 
     return DashboardResponse(
         stats=stats,

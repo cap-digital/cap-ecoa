@@ -1,14 +1,18 @@
 from fastapi import APIRouter, HTTPException, Depends, Query
 from typing import Optional, List
 from datetime import datetime, timedelta
-from ..database import get_supabase
+from sqlalchemy.orm import Session
+from sqlalchemy import or_, and_
+
+from ..database import get_db
+from ..models import User, News, MonitoredTerm
+from ..services.auth import get_current_user
 from ..schemas.news import (
     NewsResponse,
     NewsListResponse,
     NewsSource,
     SentimentType
 )
-from .auth import get_current_user
 
 router = APIRouter(prefix="/news", tags=["News"])
 
@@ -22,16 +26,16 @@ async def list_news(
     end_date: Optional[datetime] = Query(None, description="Data final"),
     page: int = Query(1, ge=1),
     per_page: int = Query(20, ge=1, le=100),
-    current_user=Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
 ):
-    supabase = get_supabase()
-
     # Get user's monitored terms
-    user_terms = supabase.table("ecoa_monitored_terms").select("term").eq(
-        "user_id", current_user.id
-    ).eq("is_active", True).execute()
+    user_terms = db.query(MonitoredTerm).filter(
+        MonitoredTerm.user_id == current_user.id,
+        MonitoredTerm.is_active == True
+    ).all()
 
-    terms = [t["term"] for t in user_terms.data] if user_terms.data else []
+    terms = [t.term for t in user_terms]
 
     if not terms:
         return NewsListResponse(
@@ -43,65 +47,72 @@ async def list_news(
         )
 
     # Build query
-    query = supabase.table("ecoa_news").select("*", count="exact")
+    query = db.query(News)
 
     # Filter by source
     if source:
-        query = query.eq("source", source.value)
+        query = query.filter(News.source == source.value)
 
     # Filter by sentiment
     if sentiment:
-        query = query.eq("sentiment", sentiment.value)
+        query = query.filter(News.sentiment == sentiment.value)
 
     # Filter by date range
     if start_date:
-        query = query.gte("published_at", start_date.isoformat())
+        query = query.filter(News.published_at >= start_date)
     if end_date:
-        query = query.lte("published_at", end_date.isoformat())
+        query = query.filter(News.published_at <= end_date)
 
     # Filter by term in title or content
     if term:
-        query = query.or_(f"title.ilike.%{term}%,content.ilike.%{term}%")
+        query = query.filter(
+            or_(
+                News.title.ilike(f"%{term}%"),
+                News.content.ilike(f"%{term}%")
+            )
+        )
     else:
         # Filter by any of user's monitored terms
-        term_filters = ",".join([
-            f"title.ilike.%{t}%,content.ilike.%{t}%" for t in terms
-        ])
-        query = query.or_(term_filters)
+        term_filters = []
+        for t in terms:
+            term_filters.append(News.title.ilike(f"%{t}%"))
+            term_filters.append(News.content.ilike(f"%{t}%"))
+        if term_filters:
+            query = query.filter(or_(*term_filters))
+
+    # Get total count
+    total = query.count()
 
     # Pagination
     offset = (page - 1) * per_page
-    query = query.order("published_at", desc=True).range(offset, offset + per_page - 1)
+    news_list = query.order_by(News.published_at.desc()).offset(offset).limit(per_page).all()
 
-    result = query.execute()
-
-    total = result.count or 0
     total_pages = (total + per_page - 1) // per_page
 
     items = []
-    for news in result.data or []:
+    for news in news_list:
         # Find which terms match this news
         matched_terms = []
-        title_lower = (news.get("title") or "").lower()
-        content_lower = (news.get("content") or "").lower()
+        title_lower = (news.title or "").lower()
+        content_lower = (news.content or "").lower()
 
         for t in terms:
             if t.lower() in title_lower or t.lower() in content_lower:
                 matched_terms.append(t)
 
         items.append(NewsResponse(
-            id=news["id"],
-            title=news["title"],
-            summary=news.get("summary"),
-            content=news.get("content"),
-            url=news["url"],
-            image_url=news.get("image_url"),
-            author=news.get("author"),
-            source=news["source"],
-            published_at=news.get("published_at"),
-            sentiment=news.get("sentiment"),
-            sentiment_score=news.get("sentiment_score"),
-            scraped_at=news["scraped_at"],
+            id=news.id,
+            title=news.title,
+            summary=news.summary,
+            content=news.content,
+            url=news.url,
+            image_url=news.image_url,
+            author=news.author,
+            source=news.source,
+            published_at=news.published_at,
+            sentiment=news.sentiment.value if news.sentiment else None,
+            sentiment_score=news.sentiment_score,
+            scraped_at=news.scraped_at,
             matched_terms=matched_terms
         ))
 
@@ -115,50 +126,50 @@ async def list_news(
 
 
 @router.get("/{news_id}", response_model=NewsResponse)
-async def get_news(news_id: str, current_user=Depends(get_current_user)):
-    supabase = get_supabase()
+async def get_news(
+    news_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    news = db.query(News).filter(News.id == news_id).first()
 
-    result = supabase.table("ecoa_news").select("*").eq("id", news_id).single().execute()
-
-    if not result.data:
+    if not news:
         raise HTTPException(status_code=404, detail="Notícia não encontrada")
 
-    news = result.data
-
     # Get user's terms to show matches
-    user_terms = supabase.table("ecoa_monitored_terms").select("term").eq(
-        "user_id", current_user.id
-    ).execute()
+    user_terms = db.query(MonitoredTerm).filter(
+        MonitoredTerm.user_id == current_user.id
+    ).all()
 
-    terms = [t["term"] for t in user_terms.data] if user_terms.data else []
+    terms = [t.term for t in user_terms]
     matched_terms = []
 
-    title_lower = (news.get("title") or "").lower()
-    content_lower = (news.get("content") or "").lower()
+    title_lower = (news.title or "").lower()
+    content_lower = (news.content or "").lower()
 
     for t in terms:
         if t.lower() in title_lower or t.lower() in content_lower:
             matched_terms.append(t)
 
     return NewsResponse(
-        id=news["id"],
-        title=news["title"],
-        summary=news.get("summary"),
-        content=news.get("content"),
-        url=news["url"],
-        image_url=news.get("image_url"),
-        author=news.get("author"),
-        source=news["source"],
-        published_at=news.get("published_at"),
-        sentiment=news.get("sentiment"),
-        sentiment_score=news.get("sentiment_score"),
-        scraped_at=news["scraped_at"],
+        id=news.id,
+        title=news.title,
+        summary=news.summary,
+        content=news.content,
+        url=news.url,
+        image_url=news.image_url,
+        author=news.author,
+        source=news.source,
+        published_at=news.published_at,
+        sentiment=news.sentiment.value if news.sentiment else None,
+        sentiment_score=news.sentiment_score,
+        scraped_at=news.scraped_at,
         matched_terms=matched_terms
     )
 
 
 @router.get("/sources/list")
-async def list_sources(current_user=Depends(get_current_user)):
+async def list_sources(current_user: User = Depends(get_current_user)):
     return {
         "sources": [
             {"id": "g1", "name": "G1", "url": "https://g1.globo.com"},
